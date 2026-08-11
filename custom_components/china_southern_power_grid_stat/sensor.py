@@ -774,16 +774,18 @@ class CSGCoordinator(DataUpdateCoordinator):
                 account.account_number,
                 result,
             )
-            # the sensor state is the latest record summary, the full list is
-            # kept in the attributes
+            # the sensor state summarizes the latest record and the total
+            # count, the full list is kept in the attributes
             if payment_history:
                 latest = payment_history[0]
-                latest_summary = f"{latest.get('time')} {latest.get('amount', '')}"
+                parts = [str(latest.get("time", ""))]
+                if latest.get("amount") is not None:
+                    parts.append(str(latest["amount"]))
                 if latest.get("way"):
-                    latest_summary += f" {latest['way']}"
+                    parts.append(latest["way"])
                 if latest.get("note"):
-                    latest_summary += f" {latest['note']}"
-                state = latest_summary.strip()
+                    parts.append(latest["note"])
+                state = f"最近缴费 {' '.join(parts)}(共{len(payment_history)}条)"
             else:
                 state = STATE_UNAVAILABLE
         else:
@@ -885,7 +887,7 @@ class CSGCoordinator(DataUpdateCoordinator):
                 account.account_number,
                 result,
             )
-            state = ladder_info.get("current_gear", STATE_UNAVAILABLE)
+            state = self._build_ladder_state_text(ladder_info)
         else:
             ladder_info = STATE_UNAVAILABLE
             state = STATE_UNAVAILABLE
@@ -898,6 +900,27 @@ class CSGCoordinator(DataUpdateCoordinator):
         self._gathered_data[account.account_number][ATTR_KEY_ANNUAL_LADDER] = {
             ATTR_KEY_ANNUAL_LADDER: ladder_info
         }
+
+    @staticmethod
+    def _build_ladder_state_text(ladder_info: dict) -> str:
+        """Build a human readable summary as the sensor state"""
+        lines = [
+            f"截至{ladder_info.get('business_date')},您的年度阶梯累计电量为"
+            f"{ladder_info.get('annual_kwh')}千瓦时（度），处于{ladder_info.get('current_gear')}阶梯，"
+            f"当前阶梯电价为{ladder_info.get('current_price')}元/千瓦时，"
+            f"当前阶梯剩余电量为{ladder_info.get('gear_left')}千瓦时（度）。"
+        ]
+        for ladder in ladder_info.get("ladder_list") or []:
+            top = ladder.get("top")
+            if top and int(top) >= 9999999:
+                range_str = f"{ladder.get('bottom')}kW.h以上"
+            else:
+                range_str = f"{ladder.get('bottom')}-{top}kW.h"
+            lines.append(f"{ladder.get('name')}（{range_str}）{ladder.get('price')}元/千瓦时")
+        lines.append(
+            f"年阶梯电量起止日期{ladder_info.get('start_date')}-{ladder_info.get('end_date')}"
+        )
+        return "\n".join(lines)
 
     async def _async_update_yesterday_kwh(self, account: CSGElectricityAccount):
         """Update yesterday's kwh"""
