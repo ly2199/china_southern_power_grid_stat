@@ -36,6 +36,7 @@ from homeassistant.helpers.update_coordinator import (
 from . import CONF_UPDATED_AT
 from .const import (
     ATTR_KEY_ACCOUNT_INFO,
+    ATTR_KEY_ANNUAL_LADDER,
     ATTR_KEY_BILL_DETAILS,
     ATTR_KEY_BILL_HISTORY,
     ATTR_KEY_CURRENT_LADDER_START_DATE,
@@ -73,8 +74,10 @@ from .const import (
     SUFFIX_LAST_YEAR_KWH,
     SUFFIX_LATEST_DAY_COST,
     SUFFIX_LATEST_DAY_KWH,
+    SUFFIX_ANNUAL_LADDER,
     SUFFIX_OUTAGE_EVENT,
     SUFFIX_OUTAGE_NOTICE,
+    SUFFIX_PAYMENT_HISTORY,
     SUFFIX_THIS_MONTH_AVG_TEMP,
     SUFFIX_THIS_MONTH_CALENDAR,
     SUFFIX_THIS_MONTH_COST,
@@ -182,6 +185,20 @@ async def async_setup_entry(
                 ele_account_number,
                 SUFFIX_THIS_MONTH_CALENDAR,
                 extra_state_attributes_key=ATTR_KEY_THIS_MONTH_CALENDAR,
+            ),
+            # annual ladder info (current gear, prices, remaining kwh)
+            CSGAnnualLadderSensor(
+                coordinator,
+                ele_account_number,
+                SUFFIX_ANNUAL_LADDER,
+                extra_state_attributes_key=ATTR_KEY_ANNUAL_LADDER,
+            ),
+            # recent payment/recharge records
+            CSGPaymentHistorySensor(
+                coordinator,
+                ele_account_number,
+                SUFFIX_PAYMENT_HISTORY,
+                extra_state_attributes_key=ATTR_KEY_PAYMENT_HISTORY,
             ),
             # latest outage/maintenance notice of the region
             CSGOutageNoticeSensor(
@@ -426,6 +443,18 @@ class CSGOutageEventSensor(CSGBaseSensor):
     """Representation of ongoing/upcoming power outages near the home."""
 
     _attr_icon = "mdi:flash-alert"
+
+
+class CSGAnnualLadderSensor(CSGBaseSensor):
+    """Representation of the annual ladder (tier) info of the account."""
+
+    _attr_icon = "mdi:stairs"
+
+
+class CSGPaymentHistorySensor(CSGBaseSensor):
+    """Representation of the recent payment/recharge records."""
+
+    _attr_icon = "mdi:currency-cny"
 
 
 class CSGLadderStageSensor(CSGBaseSensor):
@@ -745,38 +774,33 @@ class CSGCoordinator(DataUpdateCoordinator):
                 account.account_number,
                 result,
             )
+            # the sensor state is the latest record summary, the full list is
+            # kept in the attributes
+            if payment_history:
+                latest = payment_history[0]
+                latest_summary = f"{latest.get('time')} {latest.get('amount', '')}"
+                if latest.get("way"):
+                    latest_summary += f" {latest['way']}"
+                if latest.get("note"):
+                    latest_summary += f" {latest['note']}"
+                state = latest_summary.strip()
+            else:
+                state = STATE_UNAVAILABLE
         else:
             payment_history = STATE_UNAVAILABLE
+            state = STATE_UNAVAILABLE
             _LOGGER.error(
                 "Error updating payment history for account %s: %s",
                 account.account_number,
                 result,
             )
+        self._gathered_data[account.account_number][SUFFIX_PAYMENT_HISTORY] = state
         self._gathered_data[account.account_number][ATTR_KEY_PAYMENT_HISTORY] = {
-            ATTR_KEY_PAYMENT_HISTORY: payment_history
+            ATTR_KEY_PAYMENT_HISTORY: {
+                "count": len(payment_history) if isinstance(payment_history, list) else 0,
+                "list": payment_history,
+            }
         }
-
-    def _merge_payment_history_into_account_info(
-        self, account: CSGElectricityAccount
-    ):
-        """Attach the payment history to the account info attribute"""
-        payment_attr = self._gathered_data[account.account_number].get(
-            ATTR_KEY_PAYMENT_HISTORY, {}
-        ).get(ATTR_KEY_PAYMENT_HISTORY)
-        if payment_attr is None:
-            return
-        account_info = self._gathered_data[account.account_number].get(
-            ATTR_KEY_ACCOUNT_INFO, {}
-        )
-        info = account_info.get(ATTR_KEY_ACCOUNT_INFO)
-        if not isinstance(info, dict):
-            info = {}
-        if payment_attr != STATE_UNAVAILABLE:
-            info["payment_history"] = payment_attr
-        account_info[ATTR_KEY_ACCOUNT_INFO] = info
-        self._gathered_data[account.account_number][
-            ATTR_KEY_ACCOUNT_INFO
-        ] = account_info
 
     async def _async_update_outage_notice(self, account: CSGElectricityAccount):
         """Update the outage/maintenance notices of the region"""
@@ -847,6 +871,32 @@ class CSGCoordinator(DataUpdateCoordinator):
         self._gathered_data[account.account_number][SUFFIX_OUTAGE_EVENT] = ongoing
         self._gathered_data[account.account_number][ATTR_KEY_OUTAGE_EVENTS] = {
             ATTR_KEY_OUTAGE_EVENTS: data
+        }
+
+    async def _async_update_annual_ladder(self, account: CSGElectricityAccount):
+        """Update the annual ladder info of the account"""
+        success, result = await self._async_fetch(
+            self._client.get_annual_ladder_info, account, self._this_month_ym
+        )
+        if success:
+            ladder_info = result
+            _LOGGER.debug(
+                "Updated annual ladder info for account %s: %s",
+                account.account_number,
+                result,
+            )
+            state = ladder_info.get("current_gear", STATE_UNAVAILABLE)
+        else:
+            ladder_info = STATE_UNAVAILABLE
+            state = STATE_UNAVAILABLE
+            _LOGGER.error(
+                "Error updating annual ladder info for account %s: %s",
+                account.account_number,
+                result,
+            )
+        self._gathered_data[account.account_number][SUFFIX_ANNUAL_LADDER] = state
+        self._gathered_data[account.account_number][ATTR_KEY_ANNUAL_LADDER] = {
+            ATTR_KEY_ANNUAL_LADDER: ladder_info
         }
 
     async def _async_update_yesterday_kwh(self, account: CSGElectricityAccount):
@@ -1404,12 +1454,12 @@ class CSGCoordinator(DataUpdateCoordinator):
             self._async_update_payment_history(account),
             self._async_update_outage_notice(account),
             self._async_update_outage_event(account),
+            self._async_update_annual_ladder(account),
             return_exceptions=True,
         )
         try:
             self._update_latest_day(account)
             self._merge_temperature_into_month_by_day(account)
-            self._merge_payment_history_into_account_info(account)
         except Exception as exc:  # pylint: disable=broad-except
             _LOGGER.error(
                 "Ele account %s, update latest day data failed: %s",

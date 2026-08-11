@@ -905,6 +905,87 @@ class CSGClient:
         if resp_data["power"] is not None:
             return float(resp_data["power"])
 
+    def api_query_annual_tier_info(
+        self,
+        year_month: tuple[int, int],
+        area_code: str,
+        ele_customer_id: str,
+        metering_point_id: str,
+    ) -> dict:
+        """Get the annual electricity tier info (ladder stages and prices)"""
+        path = "charge/queryAnnualElectricityTierInfo"
+        payload = {
+            JSON_KEY_AREA_CODE: area_code,
+            JSON_KEY_ELE_CUST_ID: ele_customer_id,
+            JSON_KEY_METERING_POINT_ID: metering_point_id,
+            JSON_KEY_YEAR_MONTH: f"{year_month[0]}{year_month[1]:02d}",
+        }
+        _, resp_data = self._make_request(path, payload)
+        if resp_data[JSON_KEY_STA] == RESP_STA_SUCCESS:
+            return resp_data[JSON_KEY_DATA]
+        self._handle_unsuccessful_response(path, resp_data)
+
+    def get_annual_ladder_info(
+        self, account: CSGElectricityAccount, year_month: tuple[int, int]
+    ) -> dict:
+        """Get the annual ladder info of the account.
+
+        Returns the raw data enriched with a human readable summary, e.g.:
+        {
+          "business_date", "annual_kwh", "gear_left", "current_gear",
+          "current_price", "start_date", "end_date", "ladder_list", "summary"
+        }
+        """
+        resp = self.api_query_annual_tier_info(
+            year_month,
+            account.area_code,
+            account.ele_customer_id,
+            account.metering_point_id,
+        )
+        ladder_list = []
+        for item in resp.get("ladderInfoList") or []:
+            bottom = item.get("threshholdBottom")
+            top = item.get("threshholdTop")
+            ladder_list.append(
+                {
+                    "name": item.get("ladderName"),
+                    "bottom": bottom,
+                    "top": top,
+                    "price": item.get("priceValue"),
+                }
+            )
+
+        summary_lines = [
+            f"截至{resp.get('businessDate')},您的年度阶梯累计电量为"
+            f"{resp.get('totalElectricityOfYear')}千瓦时（度），处于{resp.get('currentGear')}阶梯， "
+            f"当前阶梯电价为{resp.get('currentElectricityPrice')}元/千瓦时， "
+            f"当前阶梯剩余电量为{resp.get('gearPowerLeft')}千瓦时（度）。"
+        ]
+        for ladder in ladder_list:
+            top = ladder["top"]
+            if top and int(top) >= 9999999:
+                range_str = f"{ladder['bottom']}kW.h以上"
+            else:
+                range_str = f"{ladder['bottom']}-{top}kW.h"
+            summary_lines.append(
+                f"{ladder['name']}（{range_str}）\n{ladder['price']}元/千瓦时"
+            )
+        summary_lines.append(
+            f"您的年阶梯电量起止日期为{resp.get('startDate')}-{resp.get('endDate')}"
+        )
+
+        return {
+            "business_date": resp.get("businessDate"),
+            "annual_kwh": resp.get("totalElectricityOfYear"),
+            "gear_left": resp.get("gearPowerLeft"),
+            "current_gear": resp.get("currentGear"),
+            "current_price": resp.get("currentElectricityPrice"),
+            "start_date": resp.get("startDate"),
+            "end_date": resp.get("endDate"),
+            "ladder_list": ladder_list,
+            "summary": "\n".join(summary_lines),
+        }
+
     def get_month_daily_calendar(
         self, account: CSGElectricityAccount, year_month: tuple[int, int]
     ) -> tuple[float | None, float | None, float | None, list[dict], dict]:
@@ -915,17 +996,37 @@ class CSGClient:
         periods where available).
         """
         year, month = year_month
-        resp_data = self.api_query_electricity_calender(
-            year,
-            month,
-            account.area_code,
-            account.ele_customer_id,
-            account.metering_point_id,
-            account.metering_point_number,
-        )
+        # prefer the day electric + temperature api (fresher data), fall back
+        # to the electricity calendar api
+        try:
+            resp_data = self.api_query_day_electric_and_temperature(
+                year,
+                month,
+                account.area_code,
+                account.ele_customer_id,
+                account.metering_point_id,
+            )
+            date_prefix = str(year)
+        except CSGAPIError:
+            resp_data = self.api_query_electricity_calender(
+                year,
+                month,
+                account.area_code,
+                account.ele_customer_id,
+                account.metering_point_id,
+                account.metering_point_number,
+            )
+            date_prefix = ""
+        if isinstance(resp_data, list):
+            items = resp_data
+        else:
+            items = resp_data.get("result") or []
         by_day = []
-        for d in resp_data.get("result") or []:
-            entry = {WF_ATTR_DATE: d["date"]}
+        for d in items:
+            date_str = d["date"]
+            if date_str.startswith("-"):
+                date_str = date_prefix + date_str
+            entry = {WF_ATTR_DATE: date_str}
             if d.get("power") is not None:
                 entry[WF_ATTR_KWH] = float(d["power"])
             if d.get("maxTemperature") is not None:
@@ -944,18 +1045,24 @@ class CSGClient:
         min_temp = min(mins) if mins else None
 
         summary: dict[str, Any] = {}
-        for src_key, dst_key in (
-            ("totalPower", "total_power"),
-            ("totalPeakPeriod", "peak_period"),
-            ("totalAcme", "acme"),
-            ("totalValleyStage", "valley_stage"),
-            ("totalParallelPeriod", "parallel_period"),
-            ("meteringPointNumber", "metering_point_number"),
-            ("deviceIdentif", "device_identif"),
-        ):
-            value = resp_data.get(src_key)
-            if value is not None:
-                summary[dst_key] = value
+        if isinstance(resp_data, dict):
+            for src_key, dst_key in (
+                ("totalPower", "total_power"),
+                ("totalPeakPeriod", "peak_period"),
+                ("totalAcme", "acme"),
+                ("totalValleyStage", "valley_stage"),
+                ("totalParallelPeriod", "parallel_period"),
+                ("meteringPointNumber", "metering_point_number"),
+                ("deviceIdentif", "device_identif"),
+            ):
+                value = resp_data.get(src_key)
+                if value is not None:
+                    summary[dst_key] = value
+        if "total_power" not in summary:
+            # the day electric + temperature api has no month total, compute it
+            summary["total_power"] = round(
+                sum(e[WF_ATTR_KWH] for e in by_day if WF_ATTR_KWH in e), 2
+            )
         return avg_temp, max_temp, min_temp, by_day, summary
 
     def get_bill_details(
