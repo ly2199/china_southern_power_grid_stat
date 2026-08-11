@@ -745,8 +745,8 @@ class CSGClient:
         except CSGAPIError:
             # the daily charge api is not supported in some regions (e.g. Yunnan),
             # fall back to the monthly bill which contains total charge/kwh
-            _LOGGER.warning(
-                "Daily charge api failed for account %s %d-%02d, "
+            _LOGGER.debug(
+                "Daily charge api unavailable for account %s %d-%02d, "
                 "falling back to monthly bill details",
                 account.account_number,
                 year,
