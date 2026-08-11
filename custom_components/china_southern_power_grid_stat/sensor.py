@@ -46,6 +46,7 @@ from .const import (
     ATTR_KEY_OUTAGE_NOTICES,
     ATTR_KEY_PAYMENT_HISTORY,
     ATTR_KEY_THIS_MONTH_BY_DAY,
+    ATTR_KEY_THIS_MONTH_CALENDAR,
     ATTR_KEY_THIS_MONTH_TEMPERATURE,
     ATTR_KEY_THIS_YEAR_BY_MONTH,
     CONF_AUTH_TOKEN,
@@ -75,6 +76,7 @@ from .const import (
     SUFFIX_OUTAGE_EVENT,
     SUFFIX_OUTAGE_NOTICE,
     SUFFIX_THIS_MONTH_AVG_TEMP,
+    SUFFIX_THIS_MONTH_CALENDAR,
     SUFFIX_THIS_MONTH_COST,
     SUFFIX_THIS_MONTH_KWH,
     SUFFIX_THIS_YEAR_COST,
@@ -172,6 +174,14 @@ async def async_setup_entry(
                 ele_account_number,
                 SUFFIX_THIS_MONTH_AVG_TEMP,
                 extra_state_attributes_key=ATTR_KEY_THIS_MONTH_TEMPERATURE,
+            ),
+            # electricity calendar: latest day's usage, with attributes of the
+            # daily usage (kwh + temperatures) of the whole month
+            CSGEnergySensor(
+                coordinator,
+                ele_account_number,
+                SUFFIX_THIS_MONTH_CALENDAR,
+                extra_state_attributes_key=ATTR_KEY_THIS_MONTH_CALENDAR,
             ),
             # latest outage/maintenance notice of the region
             CSGOutageNoticeSensor(
@@ -680,6 +690,29 @@ class CSGCoordinator(DataUpdateCoordinator):
             }
         }
 
+        # electricity calendar: the state is the latest day's usage, the
+        # attributes contain the daily usage (with temperatures) of the month
+        if isinstance(temp_by_day, list) and temp_by_day:
+            latest_day = temp_by_day[-1]
+            calendar_state = latest_day.get(WF_ATTR_KWH, STATE_UNAVAILABLE)
+            calendar_attrs = {
+                "latest_date": latest_day.get(WF_ATTR_DATE),
+                "by_day": temp_by_day,
+                "total_kwh": summary.get("total_power") if isinstance(summary, dict) else None,
+                "avg_temp": avg_temp,
+                "max_temp": max_temp,
+                "min_temp": min_temp,
+            }
+        else:
+            calendar_state = STATE_UNAVAILABLE
+            calendar_attrs = STATE_UNAVAILABLE
+        self._gathered_data[account.account_number][
+            SUFFIX_THIS_MONTH_CALENDAR
+        ] = calendar_state
+        self._gathered_data[account.account_number][ATTR_KEY_THIS_MONTH_CALENDAR] = {
+            ATTR_KEY_THIS_MONTH_CALENDAR: calendar_attrs
+        }
+
     def _merge_temperature_into_month_by_day(self, account: CSGElectricityAccount):
         """Attach the daily temperature to the this_month_by_day attribute"""
         temp_attr = self._gathered_data[account.account_number].get(
@@ -757,7 +790,9 @@ class CSGCoordinator(DataUpdateCoordinator):
                 account.account_number,
                 result,
             )
-            latest = notices[0] if notices else STATE_UNAVAILABLE
+            # the sensor state is the notice name string, the full list
+            # (name + time) is kept in the attributes
+            latest = notices[0]["name"] if notices else STATE_UNAVAILABLE
         else:
             notices = STATE_UNAVAILABLE
             latest = STATE_UNAVAILABLE
