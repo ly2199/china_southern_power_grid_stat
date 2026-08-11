@@ -19,14 +19,7 @@ from .const import (
     CONF_UPDATED_AT,
     DOMAIN,
 )
-from .csg_client import (
-    CSGAPIError,
-    CSGClient,
-    CSGElectricityAccount,
-    InvalidCredentials,
-    NotLoggedIn,
-)
-from .sensor import CSGCostSensor, CSGEnergySensor
+from .csg_client import CSGClient
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 _LOGGER = logging.getLogger(__name__)
@@ -57,8 +50,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.debug(f"Unloading entry: {entry.title}")
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     _LOGGER.debug(f"Unload platforms for entry: {entry.title}, success: {unload_ok}")
-    hass.data[DOMAIN].pop(entry.entry_id)
-    return True
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id)
+    return unload_ok
 
 
 async def async_remove_config_entry_device(
@@ -111,4 +105,9 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             client.logout(entry.data[CONF_LOGIN_TYPE])
             _LOGGER.info("CSG account %s logged out", entry.data[CONF_USERNAME])
 
-    await hass.async_add_executor_job(client_logout)
+    try:
+        await hass.async_add_executor_job(client_logout)
+    except Exception:  # pylint: disable=broad-except
+        _LOGGER.warning(
+            "Failed to log out CSG account %s", entry.data[CONF_USERNAME], exc_info=True
+        )

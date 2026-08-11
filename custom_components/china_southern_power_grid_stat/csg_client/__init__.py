@@ -244,16 +244,24 @@ class CSGClient:
             headers[HEADER_X_AUTH_TOKEN] = self.auth_token
             headers[HEADER_CUST_NUMBER] = self.customer_number
         if method == "POST":
-            response = self._session.post(url, json=payload, headers=headers)
+            response = self._session.post(url, json=payload, headers=headers, timeout=60)
             if response.status_code != 200:
                 _LOGGER.error(
                     "API call %s returned status code %d", path, response.status_code
                 )
                 raise CSGHTTPError(response.status_code)
 
-            json_str = response.content.decode("utf-8", errors="ignore")
-            json_str = json_str[json_str.find("{") : json_str.rfind("}") + 1]
-            json_data = json.loads(json_str)
+            json_str = response.content.decode("utf-8", errors="ignore").strip()
+            try:
+                json_data = json.loads(json_str)
+            except json.JSONDecodeError:
+                # tolerate a response body that wraps the json object with extra text
+                start, end = json_str.find("{"), json_str.rfind("}")
+                if start == -1 or end == -1:
+                    raise CSGAPIError(
+                        "HTTP200", f"invalid response body: {json_str[:200]}"
+                    ) from None
+                json_data = json.loads(json_str[start : end + 1])
             response_data = json_data
             _LOGGER.debug(
                 "_make_request: %s, response: %s",
@@ -583,6 +591,30 @@ class CSGClient:
             return resp_data[JSON_KEY_DATA]
         self._handle_unsuccessful_response(path, resp_data)
 
+    def api_select_elec_bill_details(
+        self,
+        year: int,
+        month: int,
+        area_code: str,
+        ele_customer_id: str,
+        cur_meter_reading_times: int = 1,
+    ) -> dict:
+        """Get monthly electricity bill details (total charge/kwh, ladder info)
+        This endpoint is used as a fallback for regions where the daily charge
+        api (`queryDayElectricChargeByMPoint`) is not supported, e.g. Yunnan.
+        """
+        path = "charge/selectElecBillDetails"
+        payload = {
+            "electricityBillYearMonth": f"{year}{month:02d}",
+            "curMeterReadingTimes": cur_meter_reading_times,
+            JSON_KEY_ELE_CUST_ID: ele_customer_id,
+            JSON_KEY_AREA_CODE: area_code,
+        }
+        _, resp_data = self._make_request(path, payload)
+        if resp_data[JSON_KEY_STA] == RESP_STA_SUCCESS:
+            return resp_data[JSON_KEY_DATA]
+        self._handle_unsuccessful_response(path, resp_data)
+
     def api_logout(self, logon_chan: str, cred_type: LoginType) -> None:
         """logout"""
         path = "center/logout"
@@ -629,7 +661,10 @@ class CSGClient:
         """Verify validity of the session"""
         try:
             self.api_query_authentication_result()
-        except NotLoggedIn:
+        except CSGAPIError as err:
+            if isinstance(err, CSGHTTPError):
+                # network/server error, the session state is unknown
+                raise
             return False
         return True
 
@@ -697,13 +732,39 @@ class CSGClient:
 
         year, month = year_month
 
-        resp_data = self.api_query_day_electric_charge_by_m_point(
-            year,
-            month,
-            account.area_code,
-            account.ele_customer_id,
-            account.metering_point_id,
-        )
+        try:
+            resp_data = self.api_query_day_electric_charge_by_m_point(
+                year,
+                month,
+                account.area_code,
+                account.ele_customer_id,
+                account.metering_point_id,
+            )
+        except NotLoggedIn:
+            raise
+        except CSGAPIError:
+            # the daily charge api is not supported in some regions (e.g. Yunnan),
+            # fall back to the monthly bill which contains total charge/kwh
+            _LOGGER.warning(
+                "Daily charge api failed for account %s %d-%02d, "
+                "falling back to monthly bill details",
+                account.account_number,
+                year,
+                month,
+            )
+            try:
+                bill_data = self.api_select_elec_bill_details(
+                    year, month, account.area_code, account.ele_customer_id
+                )
+            except CSGAPIError:
+                return None, None, self._empty_ladder(), []
+            bill_detail = bill_data["billDetail"][0]
+            return (
+                float(bill_data["totalElectricity"]),
+                float(bill_detail["totalPower"]),
+                self._empty_ladder(),
+                [],
+            )
 
         by_day = []
         for d_data in resp_data["result"]:
@@ -734,8 +795,8 @@ class CSGClient:
             current_ladder = None
         # "2023-05-01 00:00:00.0"
         if resp_data["ladderEleStartDate"] is not None:
-            current_ladder_start_date = datetime.datetime.strptime(
-                resp_data["ladderEleStartDate"], "%Y-%m-%d %H:%M:%S.%f"
+            current_ladder_start_date = self._parse_ladder_start_date(
+                resp_data["ladderEleStartDate"]
             )
         else:
             current_ladder_start_date = None
@@ -756,6 +817,26 @@ class CSGClient:
         }
 
         return month_total_cost, month_total_kwh, ladder, by_day
+
+    @staticmethod
+    def _empty_ladder() -> dict:
+        """Ladder dict for regions without ladder info (e.g. Yunnan)"""
+        return {
+            WF_ATTR_LADDER: None,
+            WF_ATTR_LADDER_START_DATE: None,
+            WF_ATTR_LADDER_REMAINING_KWH: None,
+            WF_ATTR_LADDER_TARIFF: None,
+        }
+
+    @staticmethod
+    def _parse_ladder_start_date(date_str: str) -> datetime.datetime:
+        """Parse the ladder start date, tolerating different server formats"""
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.datetime.strptime(date_str, fmt)
+            except ValueError:
+                continue
+        raise ValueError(f"unrecognized ladder start date format: {date_str}")
 
     def get_balance_and_arrears(
         self, account: CSGElectricityAccount

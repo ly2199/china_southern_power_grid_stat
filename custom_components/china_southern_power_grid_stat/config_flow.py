@@ -56,6 +56,7 @@ from .const import (
 )
 from .csg_client import (
     LOGIN_TYPE_TO_QR_CODE_TYPE,
+    CSGAPIError,
     CSGClient,
     CSGElectricityAccount,
     InvalidCredentials,
@@ -284,13 +285,38 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         client: CSGClient = CSGClient()
         login_type = self.context["user_data"][CONF_LOGIN_TYPE]
         login_id = self.context["user_data"]["login_id"]
-        ok, auth_token = await self.hass.async_add_executor_job(
-            client.api_get_qr_login_status, login_id
-        )
+        errors = {}
+        try:
+            ok, auth_token = await self.hass.async_add_executor_job(
+                client.api_get_qr_login_status, login_id
+            )
+        except CSGAPIError as err:
+            # qr code expired or login failed, regenerate a new qr code
+            _LOGGER.warning("QR login failed: %s", err)
+            return await self.async_step_qr_login()
+        except RequestException:
+            errors[CONF_GENERAL_ERROR] = ERROR_CANNOT_CONNECT
+            return self.async_show_form(
+                step_id=STEP_QR_LOGIN,
+                data_schema=vol.Schema(
+                    {vol.Required(CONF_REFRESH_QR_CODE, default=False): bool}
+                ),
+                errors=errors,
+                description_placeholders={
+                    "description": f"<p>使用{LOGIN_TYPE_TO_QR_APP_NAME[login_type]}扫码登录。登录完成后，点击下一步。</p>"
+                    f'<img src="{self.context["user_data"]["image_link"]}" alt="QR code" style="width: 200px;"/>',
+                },
+            )
         if ok:
             # for QR login, use mobile number as username
             client.set_authentication_params(auth_token)
-            user_info = await self.hass.async_add_executor_job(client.api_get_user_info)
+            try:
+                user_info = await self.hass.async_add_executor_job(
+                    client.api_get_user_info
+                )
+            except CSGAPIError as err:
+                _LOGGER.warning("Failed to get user info after QR login: %s", err)
+                return await self.async_step_qr_login()
             username = user_info["mobile"]
             await self.check_and_set_unique_id(username)
             return await self.create_or_update_config_entry(
@@ -317,7 +343,10 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # TODO: username (mobile) may not be the best unique id
         unique_id = f"CSG-{username}"
         await self.async_set_unique_id(unique_id)
-        self._abort_if_unique_id_configured()
+        # during reauth the entry being re-authenticated already owns this unique
+        # id, aborting here would make reauth impossible
+        if self._reauth_entry is None:
+            self._abort_if_unique_id_configured()
 
     async def create_or_update_config_entry(
         self, auth_token, login_type, password, username
@@ -325,9 +354,10 @@ class CSGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Create or update config entry
         If the account is newly added, create a new entry
         If the account is already added (reauth), update the existing entry"""
+        # note: `password` is only used for the login request, it is not
+        # persisted in the config entry
         data = {
             CONF_USERNAME: username,
-            CONF_PASSWORD: password,
             CONF_LOGIN_TYPE: login_type,
             CONF_AUTH_TOKEN: auth_token,
             CONF_ELE_ACCOUNTS: {},

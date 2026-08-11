@@ -278,8 +278,8 @@ class CSGBaseSensor(
 
         if new_native_value == STATE_UNAVAILABLE:
             _LOGGER.debug("%s data is unavailable", self.unique_id)
-            self.async_write_ha_state()
             self._attr_available = False
+            self.async_write_ha_state()
             return
 
         # from this point the value is available
@@ -445,6 +445,14 @@ class CSGCoordinator(DataUpdateCoordinator):
                 account.account_number,
                 result,
             )
+        elif success:
+            # the api may legitimately return null when yesterday's data
+            # has not been generated yet
+            _LOGGER.debug(
+                "Yesterday's kwh for account %s: no data yet",
+                account.account_number,
+            )
+            yesterday_kwh = STATE_UNAVAILABLE
         else:
             yesterday_kwh = STATE_UNAVAILABLE
             _LOGGER.error(
@@ -549,12 +557,20 @@ class CSGCoordinator(DataUpdateCoordinator):
 
     @staticmethod
     def merge_by_day_data(
-        by_day_from_cost: list | str,
-        kwh_from_cost: float | str,
-        by_day_from_usage: list | str,
-        kwh_from_usage: float | str,
+        by_day_from_cost: list | str | None,
+        kwh_from_cost: float | str | None,
+        by_day_from_usage: list | str | None,
+        kwh_from_usage: float | str | None,
     ) -> (list | str, float | str):
         """Merge by_day_from_usage and by_day_from_cost data"""
+        if by_day_from_cost is None:
+            by_day_from_cost = STATE_UNAVAILABLE
+        if by_day_from_usage is None:
+            by_day_from_usage = STATE_UNAVAILABLE
+        if kwh_from_cost is None:
+            kwh_from_cost = STATE_UNAVAILABLE
+        if kwh_from_usage is None:
+            kwh_from_usage = STATE_UNAVAILABLE
         # merge by_day
         # determine which is the latest
         if (
@@ -575,8 +591,15 @@ class CSGCoordinator(DataUpdateCoordinator):
                 # the result from daily usage is newer
                 # but since the result from daily cost contains cost data, need to merge them
                 by_day = by_day_from_usage
-                for idx, item in enumerate(by_day_from_cost):
-                    by_day[idx][WF_ATTR_CHARGE] = item[WF_ATTR_CHARGE]
+                cost_by_date = {
+                    d[WF_ATTR_DATE]: d[WF_ATTR_CHARGE]
+                    for d in by_day_from_cost
+                    if WF_ATTR_DATE in d
+                }
+                for item in by_day:
+                    charge = cost_by_date.get(item.get(WF_ATTR_DATE))
+                    if charge is not None:
+                        item[WF_ATTR_CHARGE] = charge
 
         # determine which one to use as kwh
         if kwh_from_cost == STATE_UNAVAILABLE and kwh_from_usage == STATE_UNAVAILABLE:
@@ -595,6 +618,16 @@ class CSGCoordinator(DataUpdateCoordinator):
         self, account: CSGElectricityAccount
     ):
         """Update this month's usage, cost and ladder"""
+        self._this_month_update_completed_flag.clear()
+        try:
+            await self._async_update_this_month_stats_and_ladder_inner(account)
+        finally:
+            self._this_month_update_completed_flag.set()
+
+    async def _async_update_this_month_stats_and_ladder_inner(
+        self, account: CSGElectricityAccount
+    ):
+        """Fetch usage and cost in parallel, then merge and store the results"""
         # fetch usage and cost in parallel
         task_fetch_usage = asyncio.create_task(
             self._async_fetch(
@@ -700,15 +733,33 @@ class CSGCoordinator(DataUpdateCoordinator):
             ATTR_KEY_CURRENT_LADDER_START_DATE
         ] = {ATTR_KEY_CURRENT_LADDER_START_DATE: ladder_start_date}
 
-        self._this_month_update_completed_flag.set()
-
     async def _async_update_last_month_stats(self, account: CSGElectricityAccount):
         """Update last month's usage and cost"""
         if not self._if_update_last_month:
             # original condition, don't need to update last month's data
 
             # wait for this month's data to be updated to see if last month's data is needed
-            await self._this_month_update_completed_flag.wait()
+            try:
+                await asyncio.wait_for(
+                    self._this_month_update_completed_flag.wait(),
+                    timeout=SETTING_UPDATE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Ele account %s: timeout waiting for this month's update, "
+                    "skipping last month's update",
+                    account.account_number,
+                )
+                self._gathered_data[account.account_number][
+                    SUFFIX_LAST_MONTH_KWH
+                ] = STATE_UPDATE_UNCHANGED
+                self._gathered_data[account.account_number][
+                    SUFFIX_LAST_MONTH_COST
+                ] = STATE_UPDATE_UNCHANGED
+                self._gathered_data[account.account_number][
+                    ATTR_KEY_LAST_MONTH_BY_DAY
+                ] = {ATTR_KEY_LAST_MONTH_BY_DAY: STATE_UPDATE_UNCHANGED}
+                return
 
             if not self._if_update_last_month:
                 # don't need last month's data for latest day
@@ -813,9 +864,9 @@ class CSGCoordinator(DataUpdateCoordinator):
             if this_month_by_day != STATE_UNAVAILABLE and len(this_month_by_day) >= 1:
                 # we have this month's data, use the latest day
                 latest_day_kwh = this_month_by_day[-1][WF_ATTR_KWH]
-                latest_day_cost = (
-                    this_month_by_day[-1].get(WF_ATTR_CHARGE) or STATE_UNAVAILABLE
-                )
+                latest_day_cost = this_month_by_day[-1].get(WF_ATTR_CHARGE)
+                if latest_day_cost is None:
+                    latest_day_cost = STATE_UNAVAILABLE
                 latest_day_date = this_month_by_day[-1][WF_ATTR_DATE]
             else:
                 # this month isn't available yet (typically during the first 3 days)
