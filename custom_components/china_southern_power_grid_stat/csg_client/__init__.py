@@ -19,6 +19,7 @@ from typing import Any
 import requests
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
+from requests.adapters import HTTPAdapter
 
 from .const import *
 
@@ -195,6 +196,16 @@ class CSGClient:
         auth_token: str | None = None,
     ) -> None:
         self._session: requests.Session = requests.Session()
+        # the coordinator fetches many endpoints concurrently on this one
+        # session, enlarge the pool to avoid discarding connections
+        self._session.mount(
+            "https://",
+            HTTPAdapter(pool_connections=10, pool_maxsize=30),
+        )
+        self._session.mount(
+            "http://",
+            HTTPAdapter(pool_connections=10, pool_maxsize=30),
+        )
         self._common_headers = {
             "Host": "95598.csg.cn",
             "Content-Type": "application/json;charset=utf-8",
