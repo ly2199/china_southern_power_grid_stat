@@ -20,6 +20,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_USERNAME, STATE_UNAVAILABLE, UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import entity_registry
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
@@ -29,6 +30,9 @@ from homeassistant.helpers.update_coordinator import (
 
 from . import CONF_UPDATED_AT
 from .const import (
+    ATTR_KEY_ACCOUNT_INFO,
+    ATTR_KEY_BILL_DETAILS,
+    ATTR_KEY_BILL_HISTORY,
     ATTR_KEY_CURRENT_LADDER_START_DATE,
     ATTR_KEY_LAST_MONTH_BY_DAY,
     ATTR_KEY_LAST_YEAR_BY_MONTH,
@@ -37,6 +41,9 @@ from .const import (
     ATTR_KEY_THIS_YEAR_BY_MONTH,
     CONF_AUTH_TOKEN,
     CONF_ELE_ACCOUNTS,
+    CONF_FEATURES,
+    CONF_HAS_DAILY_CHARGE,
+    CONF_HAS_LADDER,
     CONF_SETTINGS,
     CONF_UPDATE_INTERVAL,
     DATA_KEY_LAST_UPDATE_DAY,
@@ -91,11 +98,22 @@ async def async_setup_entry(
         return
     coordinator = CSGCoordinator(hass, config_entry.entry_id)
 
+    # features may not be cached yet (e.g. right after upgrade); in that case
+    # create all sensors and let the coordinator trim the unsupported ones
+    features = config_entry.data.get(CONF_FEATURES, {})
+    has_daily_charge = features.get(CONF_HAS_DAILY_CHARGE, True)
+    has_ladder = features.get(CONF_HAS_LADDER, True)
+
     all_sensors = []
     for ele_account_number, _ in config_entry.data[CONF_ELE_ACCOUNTS].items():
         sensors = [
-            # balance
-            CSGCostSensor(coordinator, ele_account_number, SUFFIX_BAL),
+            # balance, with extra attributes about the account
+            CSGCostSensor(
+                coordinator,
+                ele_account_number,
+                SUFFIX_BAL,
+                extra_state_attributes_key=ATTR_KEY_ACCOUNT_INFO,
+            ),
             # arrears
             CSGCostSensor(coordinator, ele_account_number, SUFFIX_ARR),
             # yesterday kwh
@@ -111,13 +129,6 @@ async def async_setup_entry(
                 SUFFIX_LATEST_DAY_KWH,
                 extra_state_attributes_key=ATTR_KEY_LATEST_DAY_DATE,
             ),
-            # latest day cost that is available, with extra attributes about the date
-            CSGCostSensor(
-                coordinator,
-                ele_account_number,
-                SUFFIX_LATEST_DAY_COST,
-                extra_state_attributes_key=ATTR_KEY_LATEST_DAY_DATE,
-            ),
             # this year's total energy, with extra attributes about monthly usage
             CSGEnergySensor(
                 coordinator,
@@ -125,11 +136,12 @@ async def async_setup_entry(
                 SUFFIX_THIS_YEAR_KWH,
                 extra_state_attributes_key=ATTR_KEY_THIS_YEAR_BY_MONTH,
             ),
-            # this year's total cost
+            # this year's total cost, with extra attributes about monthly bills
             CSGCostSensor(
                 coordinator,
                 ele_account_number,
                 SUFFIX_THIS_YEAR_COST,
+                extra_state_attributes_key=ATTR_KEY_BILL_HISTORY,
             ),
             # this month's total energy, with extra attributes about daily usage
             CSGEnergySensor(
@@ -137,28 +149,6 @@ async def async_setup_entry(
                 ele_account_number,
                 SUFFIX_THIS_MONTH_KWH,
                 extra_state_attributes_key=ATTR_KEY_THIS_MONTH_BY_DAY,
-            ),
-            # this month's total cost, with extra attributes about daily usage
-            CSGCostSensor(
-                coordinator,
-                ele_account_number,
-                SUFFIX_THIS_MONTH_COST,
-                extra_state_attributes_key=ATTR_KEY_THIS_MONTH_BY_DAY,
-            ),
-            # current ladder, with extra attributes about start date
-            CSGLadderStageSensor(
-                coordinator,
-                ele_account_number,
-                SUFFIX_CURRENT_LADDER,
-                extra_state_attributes_key=ATTR_KEY_CURRENT_LADDER_START_DATE,
-            ),
-            # current ladder remaining kwh
-            CSGEnergySensor(
-                coordinator, ele_account_number, SUFFIX_CURRENT_LADDER_REMAINING_KWH
-            ),
-            # current ladder tariff
-            CSGCostSensor(
-                coordinator, ele_account_number, SUFFIX_CURRENT_LADDER_TARIFF
             ),
             # last year's total energy, with extra attributes about monthly usage
             CSGEnergySensor(
@@ -180,14 +170,59 @@ async def async_setup_entry(
                 SUFFIX_LAST_MONTH_KWH,
                 extra_state_attributes_key=ATTR_KEY_LAST_MONTH_BY_DAY,
             ),
-            # last month's total cost, with extra attributes about daily usage
+            # last month's total cost, with extra attributes about the bill
             CSGCostSensor(
                 coordinator,
                 ele_account_number,
                 SUFFIX_LAST_MONTH_COST,
-                extra_state_attributes_key=ATTR_KEY_LAST_MONTH_BY_DAY,
+                extra_state_attributes_key=ATTR_KEY_BILL_DETAILS,
             ),
         ]
+
+        if has_daily_charge:
+            sensors.extend(
+                [
+                    # latest day cost that is available, with extra attributes about the date
+                    CSGCostSensor(
+                        coordinator,
+                        ele_account_number,
+                        SUFFIX_LATEST_DAY_COST,
+                        extra_state_attributes_key=ATTR_KEY_LATEST_DAY_DATE,
+                    ),
+                    # this month's total cost, with extra attributes about daily usage
+                    CSGCostSensor(
+                        coordinator,
+                        ele_account_number,
+                        SUFFIX_THIS_MONTH_COST,
+                        extra_state_attributes_key=ATTR_KEY_THIS_MONTH_BY_DAY,
+                    ),
+                ]
+            )
+
+        if has_ladder:
+            sensors.extend(
+                [
+                    # current ladder, with extra attributes about start date
+                    CSGLadderStageSensor(
+                        coordinator,
+                        ele_account_number,
+                        SUFFIX_CURRENT_LADDER,
+                        extra_state_attributes_key=ATTR_KEY_CURRENT_LADDER_START_DATE,
+                    ),
+                    # current ladder remaining kwh
+                    CSGEnergySensor(
+                        coordinator,
+                        ele_account_number,
+                        SUFFIX_CURRENT_LADDER_REMAINING_KWH,
+                    ),
+                    # current ladder tariff
+                    CSGCostSensor(
+                        coordinator,
+                        ele_account_number,
+                        SUFFIX_CURRENT_LADDER_TARIFF,
+                    ),
+                ]
+            )
 
         all_sensors.extend(sensors)
 
@@ -431,6 +466,99 @@ class CSGCoordinator(DataUpdateCoordinator):
             )
         self._gathered_data[account.account_number][SUFFIX_BAL] = balance
         self._gathered_data[account.account_number][SUFFIX_ARR] = arrears
+
+    async def _async_update_account_info(self, account: CSGElectricityAccount):
+        """Update account info (user name, address, arrears status)"""
+        success, result = await self._async_fetch(
+            self._client.get_account_info, account
+        )
+        if success:
+            account_info = result
+            _LOGGER.debug(
+                "Updated account info for account %s: %s",
+                account.account_number,
+                result,
+            )
+        else:
+            account_info = STATE_UNAVAILABLE
+            _LOGGER.error(
+                "Error updating account info for account %s: %s",
+                account.account_number,
+                result,
+            )
+        self._gathered_data[account.account_number][ATTR_KEY_ACCOUNT_INFO] = {
+            ATTR_KEY_ACCOUNT_INFO: account_info
+        }
+
+    async def _async_update_bill_history(self, account: CSGElectricityAccount):
+        """Update monthly bill history (recent 12 months)"""
+        success, result = await self._async_fetch(
+            self._client.get_bill_history, account
+        )
+        if success:
+            bill_history = result
+            _LOGGER.debug(
+                "Updated bill history for account %s: %s",
+                account.account_number,
+                result,
+            )
+        else:
+            bill_history = STATE_UNAVAILABLE
+            _LOGGER.error(
+                "Error updating bill history for account %s: %s",
+                account.account_number,
+                result,
+            )
+        self._gathered_data[account.account_number][ATTR_KEY_BILL_HISTORY] = {
+            ATTR_KEY_BILL_HISTORY: bill_history
+        }
+
+    async def _async_update_bill_details(self, account: CSGElectricityAccount):
+        """Update the latest available bill details (attached to last month cost)"""
+        success, result = await self._async_fetch(
+            self._client.get_bill_details, account, self._last_month_ym
+        )
+        if success:
+            bill_details = self._filter_bill_details(result)
+            _LOGGER.debug(
+                "Updated bill details for account %s: %s",
+                account.account_number,
+                result,
+            )
+        else:
+            bill_details = STATE_UNAVAILABLE
+            _LOGGER.error(
+                "Error updating bill details for account %s: %s",
+                account.account_number,
+                result,
+            )
+        self._gathered_data[account.account_number][ATTR_KEY_BILL_DETAILS] = {
+            ATTR_KEY_BILL_DETAILS: bill_details
+        }
+
+    @staticmethod
+    def _filter_bill_details(bill_detail: dict) -> dict:
+        """Extract the useful fields from the raw bill detail response"""
+        mapping = {
+            "electricityBillYearMonth": "bill_year_month",
+            "meterReadingDate": "meter_read_date",
+            "lastIndicators": "last_indicators",
+            "theIndicators": "the_indicators",
+            "useElectricDay": "use_electric_day",
+            "supplyUnitName": "supply_unit",
+            "tariffCodeName": "tariff_type",
+            "receieElectricity": "bill_amount",
+            "receivablePenalty": "penalty",
+            "peakElectricityBills": "peak_bill",
+            "flatElectricityBills": "flat_bill",
+            "valleyElectricityBills": "valley_bill",
+        }
+        result = {}
+        for src_key, dst_key in mapping.items():
+            value = bill_detail.get(src_key)
+            if value is not None:
+                result[dst_key] = value
+        return result
 
     async def _async_update_yesterday_kwh(self, account: CSGElectricityAccount):
         """Update yesterday's kwh"""
@@ -975,11 +1103,14 @@ class CSGCoordinator(DataUpdateCoordinator):
         #     task_group.create_task(self._async_update_last_month_stats(account))
         await asyncio.gather(
             self._async_update_bal_arr(account),
+            self._async_update_account_info(account),
             self._async_update_yesterday_kwh(account),
             self._async_update_this_year_stats(account),
             self._async_update_last_year_stats(account),
             self._async_update_this_month_stats_and_ladder(account),
             self._async_update_last_month_stats(account),
+            self._async_update_bill_history(account),
+            self._async_update_bill_details(account),
             return_exceptions=True,
         )
         try:
@@ -1015,6 +1146,29 @@ class CSGCoordinator(DataUpdateCoordinator):
         config_entry_need_update = False
         await self._async_refresh_client()
         new_config = self._config.copy()
+
+        # detect which features the region supports (daily charge / ladder),
+        # cache the result in the config entry and remove unsupported entities
+        features = self._config.get(CONF_FEATURES)
+        if features is None and self._config[CONF_ELE_ACCOUNTS]:
+            first_account_data = next(iter(self._config[CONF_ELE_ACCOUNTS].values()))
+            first_account = CSGElectricityAccount.load(first_account_data)
+            try:
+                features = await self.hass.async_add_executor_job(
+                    self._client.probe_supported_features, first_account
+                )
+            except NotLoggedIn:
+                raise ConfigEntryAuthFailed("Login expired")
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.warning(
+                    "Failed to probe supported features, keeping all sensors",
+                    exc_info=True,
+                )
+                features = None
+            if features is not None:
+                new_config[CONF_FEATURES] = features
+                config_entry_need_update = True
+
         for account_number, account_data in self._config[CONF_ELE_ACCOUNTS].items():
             self._gathered_data[account_number] = {}
             account = CSGElectricityAccount.load(account_data)
@@ -1041,6 +1195,9 @@ class CSGCoordinator(DataUpdateCoordinator):
                             break
 
             await self._async_update_account_data(account)
+
+        if features is not None:
+            self._remove_unsupported_entities(features)
         if config_entry_need_update:
             new_config[CONF_UPDATED_AT] = str(int(time.time() * 1000))
             self.hass.config_entries.async_update_entry(
@@ -1053,3 +1210,42 @@ class CSGCoordinator(DataUpdateCoordinator):
             DATA_KEY_LAST_UPDATE_DAY
         ] = self._this_day
         return self._gathered_data
+
+    def _remove_unsupported_entities(self, features: dict) -> None:
+        """Remove entities that the account's region does not support"""
+        ladder_suffixes = {
+            SUFFIX_CURRENT_LADDER,
+            SUFFIX_CURRENT_LADDER_REMAINING_KWH,
+            SUFFIX_CURRENT_LADDER_TARIFF,
+        }
+        daily_cost_suffixes = {SUFFIX_LATEST_DAY_COST, SUFFIX_THIS_MONTH_COST}
+
+        def unsupported(suffix: str) -> bool:
+            if suffix in ladder_suffixes and not features.get(CONF_HAS_LADDER, True):
+                return True
+            if (
+                suffix in daily_cost_suffixes
+                and not features.get(CONF_HAS_DAILY_CHARGE, True)
+            ):
+                return True
+            return False
+
+        entity_reg = entity_registry.async_get(self.hass)
+        removed = False
+        for ent in entity_registry.async_entries_for_config_entry(
+            entity_reg, self._config_entry_id
+        ):
+            if not ent.unique_id or not ent.unique_id.startswith(f"{DOMAIN}."):
+                continue
+            suffix = ent.unique_id.rsplit(".", 1)[-1]
+            if unsupported(suffix):
+                entity_reg.async_remove(ent.entity_id)
+                removed = True
+                _LOGGER.info(
+                    "Removed entity %s because the region does not support it",
+                    ent.entity_id,
+                )
+        if removed:
+            _LOGGER.debug(
+                "Removed unsupported entities for entry %s", self._config_entry_id
+            )

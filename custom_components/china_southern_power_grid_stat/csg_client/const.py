@@ -106,3 +106,10 @@ WF_ATTR_DATE = "date"
 WF_ATTR_MONTH = "month"
 WF_ATTR_CHARGE = "charge"
 WF_ATTR_KWH = "kwh"
+WF_ATTR_USER_NAME = "user_name"
+WF_ATTR_ADDRESS = "address"
+WF_ATTR_ARREARS_STATUS = "arrears_status"
+
+# per-account supported features, detected at runtime
+CONF_HAS_DAILY_CHARGE = "has_daily_charge"
+CONF_HAS_LADDER = "has_ladder"

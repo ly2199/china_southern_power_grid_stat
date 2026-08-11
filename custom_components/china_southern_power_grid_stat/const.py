@@ -2,7 +2,7 @@
 
 from datetime import timedelta
 
-from .csg_client import LoginType
+from .csg_client import CONF_HAS_DAILY_CHARGE, CONF_HAS_LADDER, LoginType
 
 DOMAIN = "china_southern_power_grid_stat"
 
@@ -19,6 +19,8 @@ CONF_UPDATED_AT = "updated_at"
 CONF_ACTION = "action"
 CONF_SMS_CODE = "sms_code"
 CONF_REFRESH_QR_CODE = "refresh_qr_code"
+# per-account supported features, detected at runtime and cached in the entry
+CONF_FEATURES = "features"
 
 STEP_USER = "user"
 STEP_SMS_LOGIN = "sms_login"
@@ -76,6 +78,9 @@ ATTR_KEY_LAST_MONTH_BY_DAY = "last_month_by_day"
 ATTR_KEY_LAST_YEAR_BY_MONTH = "last_year_by_month"
 ATTR_KEY_LATEST_DAY_DATE = "latest_day_date"
 ATTR_KEY_CURRENT_LADDER_START_DATE = "current_ladder_start_date"
+ATTR_KEY_BILL_DETAILS = "bill_details"
+ATTR_KEY_BILL_HISTORY = "bill_history"
+ATTR_KEY_ACCOUNT_INFO = "account_info"
 
 STATE_UPDATE_UNCHANGED = "unchanged"
 DATA_KEY_LAST_UPDATE_DAY = "last_update_day"

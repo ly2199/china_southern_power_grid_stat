@@ -615,6 +615,28 @@ class CSGClient:
             return resp_data[JSON_KEY_DATA]
         self._handle_unsuccessful_response(path, resp_data)
 
+    def api_select_bill_charts_list(
+        self,
+        start_year: int,
+        start_month: int,
+        end_year: int,
+        end_month: int,
+        area_code: str,
+        ele_customer_id: str,
+    ) -> list[dict]:
+        """Get a list of monthly bills in the given year-month range"""
+        path = "charge/selectBillchartsList"
+        payload = {
+            JSON_KEY_AREA_CODE: area_code,
+            JSON_KEY_ELE_CUST_ID: ele_customer_id,
+            "startYearMonth": f"{start_year}{start_month:02d}",
+            "endYearMonth": f"{end_year}{end_month:02d}",
+        }
+        _, resp_data = self._make_request(path, payload)
+        if resp_data[JSON_KEY_STA] == RESP_STA_SUCCESS:
+            return resp_data[JSON_KEY_DATA]
+        self._handle_unsuccessful_response(path, resp_data)
+
     def api_logout(self, logon_chan: str, cred_type: LoginType) -> None:
         """logout"""
         path = "center/logout"
@@ -879,5 +901,107 @@ class CSGClient:
         )
         if resp_data["power"] is not None:
             return float(resp_data["power"])
+
+    def get_bill_details(
+        self, account: CSGElectricityAccount, year_month: tuple[int, int]
+    ) -> dict:
+        """Get the raw bill detail dict of the given year-month"""
+        year, month = year_month
+        bill_data = self.api_select_elec_bill_details(
+            year, month, account.area_code, account.ele_customer_id
+        )
+        return bill_data["billDetail"][0]
+
+    def get_bill_history(
+        self, account: CSGElectricityAccount
+    ) -> list[dict[str, str | float]]:
+        """Get the recent 12 months of bills: [{month, charge, kwh}]
+
+        Note: the server ignores the requested year-month range and always
+        returns the most recent 12 bills.
+        """
+        now = datetime.datetime.now()
+        bills = self.api_select_bill_charts_list(
+            now.year - 1, 1, now.year, 12, account.area_code, account.ele_customer_id
+        )
+        result = []
+        for b in bills:
+            result.append(
+                {
+                    WF_ATTR_MONTH: str(b["electricityBillYearMonth"]),
+                    WF_ATTR_CHARGE: float(b["totalElectricity"]),
+                    WF_ATTR_KWH: float(b["totalPower"]),
+                }
+            )
+        result.sort(key=lambda x: x[WF_ATTR_MONTH])
+        return result
+
+    def get_account_info(self, account: CSGElectricityAccount) -> dict:
+        """Get user name, address and arrears status of the account"""
+        resp_data = self.api_query_charges(account.area_code, account.ele_customer_id)
+        ele = resp_data[0]["ele"]
+        return {
+            WF_ATTR_USER_NAME: ele.get("userName"),
+            WF_ATTR_ADDRESS: ele.get("eleAddress"),
+            WF_ATTR_ARREARS_STATUS: ele.get("arrearsStatusCode"),
+        }
+
+    def probe_supported_features(
+        self, account: CSGElectricityAccount
+    ) -> dict[str, bool]:
+        """Detect which features the account's region supports.
+
+        The daily charge api and the ladder info are Shenzhen-first features,
+        some regions (e.g. Yunnan) do not have them.
+        """
+        from .const import CONF_HAS_DAILY_CHARGE, CONF_HAS_LADDER
+
+        features = {
+            CONF_HAS_DAILY_CHARGE: False,
+            CONF_HAS_LADDER: False,
+        }
+
+        # daily charge: probe with last month, which is also the period the
+        # coordinator always fetches
+        last_month_ym = self._last_month_tuple()
+        try:
+            self.api_query_day_electric_charge_by_m_point(
+                last_month_ym[0],
+                last_month_ym[1],
+                account.area_code,
+                account.ele_customer_id,
+                account.metering_point_id,
+            )
+            features[CONF_HAS_DAILY_CHARGE] = True
+        except NotLoggedIn:
+            raise
+        except CSGAPIError:
+            pass
+
+        # ladder: check the ladder fields of the latest available bill
+        try:
+            bill_detail = self.get_bill_details(account, last_month_ym)
+        except NotLoggedIn:
+            raise
+        except CSGAPIError:
+            bill_detail = None
+        if bill_detail is not None:
+            ladder_marker = (
+                bill_detail.get("ladderRate")
+                or bill_detail.get("ladderType")
+                or bill_detail.get("ladderProject")
+            )
+            features[CONF_HAS_LADDER] = ladder_marker is not None
+
+        return features
+
+    @staticmethod
+    def _last_month_tuple() -> tuple[int, int]:
+        """Return (year, month) of last month"""
+        now = datetime.datetime.now()
+        year, month = now.year, now.month
+        if month == 1:
+            return year - 1, 12
+        return year, month - 1
 
     # end high-level api wrappers
