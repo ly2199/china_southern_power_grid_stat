@@ -17,7 +17,12 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_USERNAME, STATE_UNAVAILABLE, UnitOfEnergy
+from homeassistant.const import (
+    CONF_USERNAME,
+    STATE_UNAVAILABLE,
+    UnitOfEnergy,
+    UnitOfTemperature,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import entity_registry
@@ -37,7 +42,11 @@ from .const import (
     ATTR_KEY_LAST_MONTH_BY_DAY,
     ATTR_KEY_LAST_YEAR_BY_MONTH,
     ATTR_KEY_LATEST_DAY_DATE,
+    ATTR_KEY_OUTAGE_EVENTS,
+    ATTR_KEY_OUTAGE_NOTICES,
+    ATTR_KEY_PAYMENT_HISTORY,
     ATTR_KEY_THIS_MONTH_BY_DAY,
+    ATTR_KEY_THIS_MONTH_TEMPERATURE,
     ATTR_KEY_THIS_YEAR_BY_MONTH,
     CONF_AUTH_TOKEN,
     CONF_ELE_ACCOUNTS,
@@ -63,6 +72,9 @@ from .const import (
     SUFFIX_LAST_YEAR_KWH,
     SUFFIX_LATEST_DAY_COST,
     SUFFIX_LATEST_DAY_KWH,
+    SUFFIX_OUTAGE_EVENT,
+    SUFFIX_OUTAGE_NOTICE,
+    SUFFIX_THIS_MONTH_AVG_TEMP,
     SUFFIX_THIS_MONTH_COST,
     SUFFIX_THIS_MONTH_KWH,
     SUFFIX_THIS_YEAR_COST,
@@ -71,6 +83,7 @@ from .const import (
 )
 from .csg_client import (
     JSON_KEY_METERING_POINT_NUMBER,
+    WF_ATTR_AVG_TEMP,
     WF_ATTR_CHARGE,
     WF_ATTR_DATE,
     WF_ATTR_KWH,
@@ -78,6 +91,8 @@ from .csg_client import (
     WF_ATTR_LADDER_REMAINING_KWH,
     WF_ATTR_LADDER_START_DATE,
     WF_ATTR_LADDER_TARIFF,
+    WF_ATTR_MAX_TEMP,
+    WF_ATTR_MIN_TEMP,
     CSGAPIError,
     CSGClient,
     CSGElectricityAccount,
@@ -149,6 +164,28 @@ async def async_setup_entry(
                 ele_account_number,
                 SUFFIX_THIS_MONTH_KWH,
                 extra_state_attributes_key=ATTR_KEY_THIS_MONTH_BY_DAY,
+            ),
+            # this month's average temperature, with extra attributes about
+            # max/min temperature and daily temperature (electricity calendar)
+            CSGTemperatureSensor(
+                coordinator,
+                ele_account_number,
+                SUFFIX_THIS_MONTH_AVG_TEMP,
+                extra_state_attributes_key=ATTR_KEY_THIS_MONTH_TEMPERATURE,
+            ),
+            # latest outage/maintenance notice of the region
+            CSGOutageNoticeSensor(
+                coordinator,
+                ele_account_number,
+                SUFFIX_OUTAGE_NOTICE,
+                extra_state_attributes_key=ATTR_KEY_OUTAGE_NOTICES,
+            ),
+            # ongoing/upcoming power outages near the home
+            CSGOutageEventSensor(
+                coordinator,
+                ele_account_number,
+                SUFFIX_OUTAGE_EVENT,
+                extra_state_attributes_key=ATTR_KEY_OUTAGE_EVENTS,
             ),
             # last year's total energy, with extra attributes about monthly usage
             CSGEnergySensor(
@@ -360,6 +397,27 @@ class CSGCostSensor(CSGBaseSensor):
     _attr_icon = "mdi:currency-cny"
 
 
+class CSGTemperatureSensor(CSGBaseSensor):
+    """Representation of a CSG Temperature Sensor."""
+
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer"
+
+
+class CSGOutageNoticeSensor(CSGBaseSensor):
+    """Representation of the latest outage/maintenance notice."""
+
+    _attr_icon = "mdi:power-plug-off"
+
+
+class CSGOutageEventSensor(CSGBaseSensor):
+    """Representation of ongoing/upcoming power outages near the home."""
+
+    _attr_icon = "mdi:flash-alert"
+
+
 class CSGLadderStageSensor(CSGBaseSensor):
     """Representation of a CSG Ladder Stage Sensor."""
 
@@ -541,17 +599,39 @@ class CSGCoordinator(DataUpdateCoordinator):
         """Extract the useful fields from the raw bill detail response"""
         mapping = {
             "electricityBillYearMonth": "bill_year_month",
+            "meteringPointNumber": "metering_point_number",
             "meterReadingDate": "meter_read_date",
             "lastIndicators": "last_indicators",
             "theIndicators": "the_indicators",
             "useElectricDay": "use_electric_day",
+            "meterReadCycle": "meter_read_cycle",
+            "billingCycle": "billing_cycle",
+            "shoPaymentDate": "payment_due_date",
+            "paymentWay": "payment_way",
             "supplyUnitName": "supply_unit",
             "tariffCodeName": "tariff_type",
+            "settleAcctName": "settle_acct_name",
             "receieElectricity": "bill_amount",
+            "curReceieElectricity": "current_bill_amount",
             "receivablePenalty": "penalty",
+            "penaltyDate": "penalty_date",
+            "historyTotalArrears": "history_total_arrears",
+            "averageElectricityPrice": "average_price",
+            "peakPower": "peak_kwh",
+            "flatPower": "flat_kwh",
+            "valleyPower": "valley_kwh",
             "peakElectricityBills": "peak_bill",
             "flatElectricityBills": "flat_bill",
             "valleyElectricityBills": "valley_bill",
+            "basicElectricity": "basic_electricity",
+            "demandTotalElectricity": "demand_electricity",
+            "oneUsed": "ladder_1_used",
+            "twoUsed": "ladder_2_used",
+            "oneSurplus": "ladder_1_surplus",
+            "twoSurplus": "ladder_2_surplus",
+            "firstUseSituation": "ladder_1_situation",
+            "secondUseSituation": "ladder_2_situation",
+            "remarks": "ladder_remarks",
         }
         result = {}
         for src_key, dst_key in mapping.items():
@@ -559,6 +639,180 @@ class CSGCoordinator(DataUpdateCoordinator):
             if value is not None:
                 result[dst_key] = value
         return result
+
+    async def _async_update_this_month_temperature(
+        self, account: CSGElectricityAccount
+    ):
+        """Update this month's temperature from the electricity calendar"""
+        success, result = await self._async_fetch(
+            self._client.get_month_daily_calendar, account, self._this_month_ym
+        )
+        if success and result is not None:
+            avg_temp, max_temp, min_temp, temp_by_day, summary = result
+            _LOGGER.debug(
+                "Updated this month's temperature for account %s: %s",
+                account.account_number,
+                result,
+            )
+        else:
+            avg_temp, max_temp, min_temp, temp_by_day, summary = (
+                STATE_UNAVAILABLE,
+                STATE_UNAVAILABLE,
+                STATE_UNAVAILABLE,
+                STATE_UNAVAILABLE,
+                STATE_UNAVAILABLE,
+            )
+            _LOGGER.error(
+                "Error updating this month's temperature for account %s: %s",
+                account.account_number,
+                result,
+            )
+        self._gathered_data[account.account_number][
+            SUFFIX_THIS_MONTH_AVG_TEMP
+        ] = avg_temp
+        self._gathered_data[account.account_number][ATTR_KEY_THIS_MONTH_TEMPERATURE] = {
+            ATTR_KEY_THIS_MONTH_TEMPERATURE: {
+                "avg": avg_temp,
+                "max": max_temp,
+                "min": min_temp,
+                "by_day": temp_by_day,
+                "summary": summary,
+            }
+        }
+
+    def _merge_temperature_into_month_by_day(self, account: CSGElectricityAccount):
+        """Attach the daily temperature to the this_month_by_day attribute"""
+        temp_attr = self._gathered_data[account.account_number].get(
+            ATTR_KEY_THIS_MONTH_TEMPERATURE, {}
+        ).get(ATTR_KEY_THIS_MONTH_TEMPERATURE, {})
+        temp_by_day = temp_attr.get("by_day")
+        month_by_day = self._gathered_data[account.account_number].get(
+            ATTR_KEY_THIS_MONTH_BY_DAY, {}
+        ).get(ATTR_KEY_THIS_MONTH_BY_DAY)
+        if not isinstance(temp_by_day, list) or not isinstance(month_by_day, list):
+            return
+        temp_by_date = {d[WF_ATTR_DATE]: d for d in temp_by_day}
+        for item in month_by_day:
+            temp = temp_by_date.get(item.get(WF_ATTR_DATE))
+            if not temp:
+                continue
+            for key in (WF_ATTR_MAX_TEMP, WF_ATTR_MIN_TEMP, WF_ATTR_AVG_TEMP):
+                if key in temp:
+                    item[key] = temp[key]
+
+    async def _async_update_payment_history(self, account: CSGElectricityAccount):
+        """Update the recent payment/recharge history"""
+        success, result = await self._async_fetch(
+            self._client.get_payment_history, account
+        )
+        if success:
+            payment_history = result
+            _LOGGER.debug(
+                "Updated payment history for account %s: %s",
+                account.account_number,
+                result,
+            )
+        else:
+            payment_history = STATE_UNAVAILABLE
+            _LOGGER.error(
+                "Error updating payment history for account %s: %s",
+                account.account_number,
+                result,
+            )
+        self._gathered_data[account.account_number][ATTR_KEY_PAYMENT_HISTORY] = {
+            ATTR_KEY_PAYMENT_HISTORY: payment_history
+        }
+
+    def _merge_payment_history_into_account_info(
+        self, account: CSGElectricityAccount
+    ):
+        """Attach the payment history to the account info attribute"""
+        payment_attr = self._gathered_data[account.account_number].get(
+            ATTR_KEY_PAYMENT_HISTORY, {}
+        ).get(ATTR_KEY_PAYMENT_HISTORY)
+        if payment_attr is None:
+            return
+        account_info = self._gathered_data[account.account_number].get(
+            ATTR_KEY_ACCOUNT_INFO, {}
+        )
+        info = account_info.get(ATTR_KEY_ACCOUNT_INFO)
+        if not isinstance(info, dict):
+            info = {}
+        if payment_attr != STATE_UNAVAILABLE:
+            info["payment_history"] = payment_attr
+        account_info[ATTR_KEY_ACCOUNT_INFO] = info
+        self._gathered_data[account.account_number][
+            ATTR_KEY_ACCOUNT_INFO
+        ] = account_info
+
+    async def _async_update_outage_notice(self, account: CSGElectricityAccount):
+        """Update the outage/maintenance notices of the region"""
+        success, result = await self._async_fetch(
+            self._client.get_outage_notices, account
+        )
+        if success:
+            notices = result
+            _LOGGER.debug(
+                "Updated outage notices for account %s: %s",
+                account.account_number,
+                result,
+            )
+            latest = notices[0] if notices else STATE_UNAVAILABLE
+        else:
+            notices = STATE_UNAVAILABLE
+            latest = STATE_UNAVAILABLE
+            _LOGGER.error(
+                "Error updating outage notices for account %s: %s",
+                account.account_number,
+                result,
+            )
+        self._gathered_data[account.account_number][SUFFIX_OUTAGE_NOTICE] = latest
+        self._gathered_data[account.account_number][ATTR_KEY_OUTAGE_NOTICES] = {
+            ATTR_KEY_OUTAGE_NOTICES: notices
+        }
+
+    async def _async_update_outage_event(self, account: CSGElectricityAccount):
+        """Update the power outages near the home location"""
+        latitude = self.hass.config.latitude
+        longitude = self.hass.config.longitude
+        if not latitude or not longitude:
+            _LOGGER.warning(
+                "Home location is not set in Home Assistant, "
+                "cannot query power outages"
+            )
+            self._gathered_data[account.account_number][SUFFIX_OUTAGE_EVENT] = (
+                STATE_UNAVAILABLE
+            )
+            self._gathered_data[account.account_number][ATTR_KEY_OUTAGE_EVENTS] = {
+                ATTR_KEY_OUTAGE_EVENTS: STATE_UNAVAILABLE
+            }
+            return
+        success, result = await self._async_fetch(
+            self._client.get_power_outages,
+            account,
+            latitude,
+            longitude,
+        )
+        if success:
+            data = result
+            _LOGGER.debug(
+                "Updated power outages for account %s: %s",
+                account.account_number,
+                result,
+            )
+            ongoing = data["ongoing"]
+        else:
+            data = STATE_UNAVAILABLE
+            ongoing = STATE_UNAVAILABLE
+            _LOGGER.error(
+                "Error updating power outages for account %s: %s",
+                account.account_number,
+                result,
+            )
+        self._gathered_data[account.account_number][SUFFIX_OUTAGE_EVENT] = ongoing
+        self._gathered_data[account.account_number][ATTR_KEY_OUTAGE_EVENTS] = {
+            ATTR_KEY_OUTAGE_EVENTS: data
+        }
 
     async def _async_update_yesterday_kwh(self, account: CSGElectricityAccount):
         """Update yesterday's kwh"""
@@ -1111,10 +1365,16 @@ class CSGCoordinator(DataUpdateCoordinator):
             self._async_update_last_month_stats(account),
             self._async_update_bill_history(account),
             self._async_update_bill_details(account),
+            self._async_update_this_month_temperature(account),
+            self._async_update_payment_history(account),
+            self._async_update_outage_notice(account),
+            self._async_update_outage_event(account),
             return_exceptions=True,
         )
         try:
             self._update_latest_day(account)
+            self._merge_temperature_into_month_by_day(account)
+            self._merge_payment_history_into_account_info(account)
         except Exception as exc:  # pylint: disable=broad-except
             _LOGGER.error(
                 "Ele account %s, update latest day data failed: %s",

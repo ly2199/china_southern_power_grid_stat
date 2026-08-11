@@ -213,6 +213,8 @@ class CSGClient:
 
         # identifier, need to be set in initialize()
         self.customer_number = None
+        # user info from getUserInfo, cached by initialize()
+        self.user_info: dict[str, Any] | None = None
 
     # begin internal utility functions
     def _make_request(
@@ -678,6 +680,7 @@ class CSGClient:
         """Initialize the client"""
         resp_data = self.api_get_user_info()
         self.customer_number = resp_data[JSON_KEY_CUST_NUMBER]
+        self.user_info = resp_data
 
     def verify_login(self) -> bool:
         """Verify validity of the session"""
@@ -902,6 +905,59 @@ class CSGClient:
         if resp_data["power"] is not None:
             return float(resp_data["power"])
 
+    def get_month_daily_calendar(
+        self, account: CSGElectricityAccount, year_month: tuple[int, int]
+    ) -> tuple[float | None, float | None, float | None, list[dict], dict]:
+        """Get daily power and temperature of the month from the electricity
+        calendar. Returns (avg_temp, max_temp, min_temp, by_day, summary) where
+        by_day items contain date, kwh, max_temp, min_temp, avg_temp, and
+        summary contains non-null month aggregates (e.g. total power, peak/valley
+        periods where available).
+        """
+        year, month = year_month
+        resp_data = self.api_query_electricity_calender(
+            year,
+            month,
+            account.area_code,
+            account.ele_customer_id,
+            account.metering_point_id,
+            account.metering_point_number,
+        )
+        by_day = []
+        for d in resp_data.get("result") or []:
+            entry = {WF_ATTR_DATE: d["date"]}
+            if d.get("power") is not None:
+                entry[WF_ATTR_KWH] = float(d["power"])
+            if d.get("maxTemperature") is not None:
+                entry[WF_ATTR_MAX_TEMP] = float(d["maxTemperature"])
+            if d.get("minTemperature") is not None:
+                entry[WF_ATTR_MIN_TEMP] = float(d["minTemperature"])
+            if d.get("averageTemperature") is not None:
+                entry[WF_ATTR_AVG_TEMP] = float(d["averageTemperature"])
+            by_day.append(entry)
+
+        avgs = [e[WF_ATTR_AVG_TEMP] for e in by_day if WF_ATTR_AVG_TEMP in e]
+        maxs = [e[WF_ATTR_MAX_TEMP] for e in by_day if WF_ATTR_MAX_TEMP in e]
+        mins = [e[WF_ATTR_MIN_TEMP] for e in by_day if WF_ATTR_MIN_TEMP in e]
+        avg_temp = sum(avgs) / len(avgs) if avgs else None
+        max_temp = max(maxs) if maxs else None
+        min_temp = min(mins) if mins else None
+
+        summary: dict[str, Any] = {}
+        for src_key, dst_key in (
+            ("totalPower", "total_power"),
+            ("totalPeakPeriod", "peak_period"),
+            ("totalAcme", "acme"),
+            ("totalValleyStage", "valley_stage"),
+            ("totalParallelPeriod", "parallel_period"),
+            ("meteringPointNumber", "metering_point_number"),
+            ("deviceIdentif", "device_identif"),
+        ):
+            value = resp_data.get(src_key)
+            if value is not None:
+                summary[dst_key] = value
+        return avg_temp, max_temp, min_temp, by_day, summary
+
     def get_bill_details(
         self, account: CSGElectricityAccount, year_month: tuple[int, int]
     ) -> dict:
@@ -937,13 +993,217 @@ class CSGClient:
         return result
 
     def get_account_info(self, account: CSGElectricityAccount) -> dict:
-        """Get user name, address and arrears status of the account"""
+        """Get all useful account info: user, address, arrears, balance details"""
         resp_data = self.api_query_charges(account.area_code, account.ele_customer_id)
         ele = resp_data[0]["ele"]
-        return {
+
+        info: dict[str, Any] = {
             WF_ATTR_USER_NAME: ele.get("userName"),
             WF_ATTR_ADDRESS: ele.get("eleAddress"),
             WF_ATTR_ARREARS_STATUS: ele.get("arrearsStatusCode"),
+            "total_owned_fee": ele.get("totalOwnedFee"),
+            "user_ele_type": ele.get("userEleType"),
+        }
+
+        # balance details from the surplus api
+        try:
+            surplus = self.api_query_account_surplus(
+                account.area_code, account.ele_customer_id
+            )[0]
+            meter = (surplus.get("electricMeterModel") or [{}])[0]
+            info["settle_acct_number"] = surplus.get("settleAcctNumber")
+            info["locked_balance"] = surplus.get("lockedBalance")
+            info["meter_device_id"] = meter.get("deviceIdentif")
+            info["meter_asset_id"] = meter.get("runningEnergymeterId")
+        except CSGAPIError:
+            pass
+
+        # user info cached by initialize()
+        if self.user_info:
+            info["mobile"] = self.user_info.get("mobile")
+            info["wechat_nickname"] = self.user_info.get("wechatNickname")
+            info["is_identity_verified"] = self.user_info.get("isIdentityVerified")
+
+        return {k: v for k, v in info.items() if v is not None}
+
+    def get_payment_history(
+        self, account: CSGElectricityAccount, limit: int = 10
+    ) -> list[dict[str, str | float]]:
+        """Get the recent payment/recharge history of the account.
+
+        Returns [{time, way, amount, note}] ordered by time descending.
+        """
+        surplus = self.api_query_account_surplus(
+            account.area_code, account.ele_customer_id
+        )[0]
+        settle_acct_id = surplus.get("settleAcctId")
+        if not settle_acct_id:
+            return []
+        resp_data = self.api_query_measurement_point_detailed(
+            account.area_code, settle_acct_id
+        )
+        result = []
+        for item in resp_data.get("balanceHistoryList") or []:
+            amount = item.get("advanceBalance")
+            entry = {
+                "time": item.get("actualTime"),
+                "way": item.get("tradeWayCode"),
+                "note": item.get("accessInstructions"),
+            }
+            if amount is not None:
+                entry["amount"] = float(amount)
+            result.append({k: v for k, v in entry.items() if v is not None})
+        return result[:limit]
+
+    def api_query_measurement_point_detailed(
+        self, area_code: str, settle_acct_id: str
+    ) -> dict:
+        """Get balance change/payment history of the settle account"""
+        path = "charge/queryMeasurementPointDetailed"
+        payload = {JSON_KEY_AREA_CODE: area_code, "settleAcctId": settle_acct_id}
+        _, resp_data = self._make_request(path, payload)
+        if resp_data[JSON_KEY_STA] == RESP_STA_SUCCESS:
+            return resp_data[JSON_KEY_DATA]
+        self._handle_unsuccessful_response(path, resp_data)
+
+    def get_outage_notices(
+        self, account: CSGElectricityAccount
+    ) -> list[dict[str, str]]:
+        """Get the maintenance/outage notices of the account's region.
+
+        Returns [{name, time}] of the recent months. Note: the per-account
+        outage event query is not supported in all regions (e.g. Yunnan),
+        this region-level notice list is the only outage info available there.
+        """
+        path = "powerFailureQuery/query/notice/all"
+        payload = {JSON_KEY_AREA_CODE: account.area_code}
+        _, resp_data = self._make_request(path, payload, with_auth=False)
+        if resp_data[JSON_KEY_STA] == RESP_STA_SUCCESS:
+            result = []
+            for item in resp_data[JSON_KEY_DATA] or []:
+                result.append(
+                    {
+                        "name": item.get("noticeName"),
+                        "time": item.get("noticeTime"),
+                    }
+                )
+            return result
+        self._handle_unsuccessful_response(path, resp_data)
+
+    def get_power_outages(
+        self,
+        account: CSGElectricityAccount,
+        latitude: float,
+        longitude: float,
+        forecast_days: int = 7,
+    ) -> dict:
+        """Query planned/fault power outages near the given coordinates.
+
+        Locates the region/supply unit by coordinates (like the CSG app's
+        location-based outage query), then queries planned (state=2) and
+        fault (state=3) outages around the account.
+
+        Returns {
+            "region": {province, city, county, town, supply_unit},
+            "events": [{range, start_time, end_time, state, type, is_electric, event_id}],
+            "ongoing": number of events that are ongoing or upcoming,
+        }
+        """
+        # 1. locate the region and supply unit by coordinates
+        path = "outageRepair/queryAdminByLocation"
+        payload = {"latitude": str(latitude), "longitude": str(longitude)}
+        _, resp_data = self._make_request(path, payload, with_auth=True)
+        if resp_data[JSON_KEY_STA] != RESP_STA_SUCCESS:
+            self._handle_unsuccessful_response(path, resp_data)
+        location = resp_data[JSON_KEY_DATA]["data"]
+        org = (location.get("orgList") or [{}])[0]
+        bureau_code = org.get("bureauCode")
+        if not bureau_code:
+            raise CSGAPIError(
+                RESP_STA_SYSTEM_ERROR,
+                "no supply unit found for the given location",
+            )
+        region = {
+            "province": location.get("province"),
+            "city": location.get("city"),
+            "county": location.get("county"),
+            "town": location.get("town"),
+            "supply_unit": org.get("orgName"),
+        }
+        region = {k: v for k, v in region.items() if v is not None}
+
+        # 2. query planned and fault outages
+        now = datetime.datetime.now()
+        start = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+        end = (now + datetime.timedelta(days=forecast_days)).strftime(
+            "%Y-%m-%d 23:59:59"
+        )
+        base_query = {
+            "unitCode": bureau_code,
+            "supplyUnitId": org.get("mrId"),
+            "provinceCode": bureau_code[:2],
+            "regionCode": location.get("townCode") or location.get("countyCode"),
+            "type": "2",
+            "address": account.account_number,
+            "outageStartDate": start,
+            "outageEndDate": end,
+            "pageNo": 1,
+            "pageSize": 10,
+        }
+        events = []
+        for state in ("2", "3"):
+            query = {**base_query, "outageState": state}
+            try:
+                _, resp = self._make_request(
+                    "outageRepair/queryPowerCutByRegionCode",
+                    query,
+                    with_auth=True,
+                )
+            except CSGAPIError:
+                continue
+            if resp[JSON_KEY_STA] != RESP_STA_SUCCESS:
+                continue
+            for item in resp.get(JSON_KEY_DATA, {}).get("infoArray") or []:
+                event = {
+                    "range": item.get("powFailRanage"),
+                    "start_time": item.get("powFailActStartTime"),
+                    "end_time": item.get("powFailActEndTime"),
+                    "state": item.get("powFailState"),
+                    "type": item.get("powFailType"),
+                    "is_electric": item.get("isElectric"),
+                    "event_id": item.get("powFailEventId"),
+                }
+                events.append({k: v for k, v in event.items() if v is not None})
+
+        # dedupe by event id and keep only recent events
+        seen = set()
+        deduped = []
+        for event in sorted(
+            events, key=lambda e: e.get("start_time") or "", reverse=True
+        ):
+            event_id = event.get("event_id")
+            if event_id and event_id in seen:
+                continue
+            if event_id:
+                seen.add(event_id)
+            deduped.append(event)
+
+        def _is_ongoing(event: dict) -> bool:
+            end = event.get("end_time")
+            if end:
+                try:
+                    end_dt = datetime.datetime.strptime(
+                        end, "%Y-%m-%d %H:%M:%S"
+                    )
+                    return end_dt >= now - datetime.timedelta(hours=1)
+                except ValueError:
+                    pass
+            return event.get("state") not in ("3",)
+
+        return {
+            "region": region,
+            "events": deduped,
+            "ongoing": sum(1 for e in deduped if _is_ongoing(e)),
         }
 
     def probe_supported_features(

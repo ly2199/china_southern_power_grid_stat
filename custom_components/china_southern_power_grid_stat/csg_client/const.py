@@ -109,6 +109,9 @@ WF_ATTR_KWH = "kwh"
 WF_ATTR_USER_NAME = "user_name"
 WF_ATTR_ADDRESS = "address"
 WF_ATTR_ARREARS_STATUS = "arrears_status"
+WF_ATTR_MAX_TEMP = "max_temp"
+WF_ATTR_MIN_TEMP = "min_temp"
+WF_ATTR_AVG_TEMP = "avg_temp"
 
 # per-account supported features, detected at runtime
 CONF_HAS_DAILY_CHARGE = "has_daily_charge"
